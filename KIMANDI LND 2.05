@@ -1,0 +1,1379 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+)
+
+//go:embed static/*
+var staticFiles embed.FS
+
+//go:embed openbb_fetch.py
+var openbbScriptTemplate string = `
+import json
+import os
+from openbb import obb
+from datetime import datetime
+
+def fetch_bitcoin_data():
+    pat = "%s"  # PAT injected here
+    if not pat:
+        raise ValueError("OPENBB_PAT environment variable not set")
+    obb.account.login(pat=pat)
+    btc_price = obb.crypto.price.historical(symbol="BTCUSD", provider="yfinance").to_dict()
+    latest_price = btc_price["historical"][-1]["close"] if "historical" in btc_price else 0.0
+    btc_economy = obb.economy.crypto(symbol="BTC").to_dict()
+    market_cap = btc_economy.get("market_cap", 0.0)
+    return {
+        "bitcoin_price": latest_price,
+        "bitcoin_market_cap": market_cap,
+        "last_updated": datetime.utcnow().isoformat()
+    }
+
+if __name__ == "__main__":
+    data = fetch_bitcoin_data()
+    print(json.dumps(data))
+`
+
+const (
+	ambossAPIEndpoint    = "https://api.amboss.space/graphql"
+	defaultPageSize      = 100
+	updateInterval       = 1 * time.Hour
+	openbbUpdateInterval = 15 * time.Minute
+	localUpdateInterval  = 5 * time.Minute
+	lndPoolSize          = 5
+	maxDelay             = 30 * time.Second
+	currentAPIVersion    = "v1"
+)
+
+// Custom error types
+var (
+	ErrAPIKeyMissing      = errors.New("API key is missing")
+	ErrAPIKeyInvalid      = errors.New("API key is invalid or expired")
+	ErrNetworkFailure     = errors.New("network request failed")
+	ErrRateLimitExceeded  = errors.New("rate limit exceeded")
+	ErrDataParseFailure   = errors.New("failed to parse data")
+	ErrScriptExecution    = errors.New("script execution failed")
+	ErrCommandFailure     = errors.New("external command failed")
+	ErrConfigInvalid      = errors.New("invalid configuration")
+	ErrLNDConnection      = errors.New("LND connection failed")
+)
+
+// WrappedError provides additional context to errors
+type WrappedError struct {
+	Err     error
+	Message string
+	Source  string
+}
+
+func (e *WrappedError) Error() string {
+	return fmt.Sprintf("%s: %s (%v)", e.Source, e.Message, e.Err)
+}
+
+func (e *WrappedError) Unwrap() error {
+	return e.Err
+}
+
+// NewWrappedError creates a new wrapped error
+func NewWrappedError(err error, source, message string) error {
+	return &WrappedError{
+		Err:     err,
+		Message: message,
+		Source:  source,
+	}
+}
+
+// Config holds the application configuration
+type Config struct {
+	AmbossAPIKey   string
+	OpenBBPAT      string
+	MaxRetries     int
+	RetryDelay     time.Duration
+	RequestsPerSec float64
+	BurstLimit     int
+	Port           string
+	LNDHost        string
+	LNDCertPath    string
+	LNCMacPath     string
+	TLSCertPath    string
+	TLSKeyPath     string
+}
+
+func validateConfig(cfg Config) error {
+	validations := []struct {
+		condition bool
+		message   string
+	}{
+		{cfg.AmbossAPIKey == "", "Amboss API key is required"},
+		{cfg.OpenBBPAT == "", "OpenBB PAT is required"},
+		{cfg.TLSCertPath == "", "TLS certificate path is required"},
+		{cfg.TLSKeyPath == "", "TLS key path is required"},
+		{cfg.Port == "", "Port is required"},
+		{cfg.RequestsPerSec <= 0, "Requests per second must be positive"},
+		{cfg.BurstLimit <= 0, "Burst limit must be positive"},
+		{cfg.MaxRetries < 0, "Max retries cannot be negative"},
+		{cfg.RetryDelay <= 0, "Retry delay must be positive"},
+	}
+
+	for _, v := range validations {
+		if v.condition {
+			return NewWrappedError(ErrConfigInvalid, "ConfigValidation", v.message)
+		}
+	}
+
+	if port, err := strconv.Atoi(cfg.Port); err != nil || port < 1 || port > 65535 {
+		return NewWrappedError(ErrConfigInvalid, "ConfigValidation",
+			"Port must be a valid number between 1 and 65535")
+	}
+
+	if cfg.LNDHost != "" {
+		if cfg.LNDCertPath == "" {
+			return NewWrappedError(ErrConfigInvalid, "ConfigValidation",
+				"LND certificate path is required when LND host is specified")
+		}
+		if cfg.LNCMacPath == "" {
+			return NewWrappedError(ErrConfigInvalid, "ConfigValidation",
+				"LND macaroon path is required when LND host is specified")
+		}
+		if !strings.Contains(cfg.LNDHost, ":") {
+			return NewWrappedError(ErrConfigInvalid, "ConfigValidation",
+				"LND host must include port (e.g., localhost:10009)")
+		}
+	}
+
+	requiredFiles := []struct {
+		path    string
+		message string
+	}{
+		{cfg.TLSCertPath, "TLS certificate file not found"},
+		{cfg.TLSKeyPath, "TLS key file not found"},
+	}
+
+	for _, f := range requiredFiles {
+		if _, err := os.Stat(f.path); os.IsNotExist(err) {
+			return NewWrappedError(ErrConfigInvalid, "ConfigValidation",
+				fmt.Sprintf("%s: %s", f.message, f.path))
+		}
+	}
+
+	return nil
+}
+
+func loadConfig() Config {
+	cfg := Config{
+		AmbossAPIKey:   getEnv("AMBOSS_API_KEY", ""),
+		OpenBBPAT:      getEnv("OPENBB_PAT", ""),
+		MaxRetries:     getEnvAsInt("MAX_RETRIES", 5),
+		RetryDelay:     getEnvAsDuration("RETRY_DELAY", time.Second),
+		RequestsPerSec: getEnvAsFloat("REQUESTS_PER_SEC", 5.0),
+		BurstLimit:     getEnvAsInt("BURST_LIMIT", 10),
+		Port:           getEnv("PORT", "8080"),
+		LNDHost:        getEnv("LND_HOST", "localhost:10009"),
+		LNDCertPath:    getEnv("LND_CERT_PATH", ""),
+		LNCMacPath:     getEnv("LND_MAC_PATH", ""),
+		TLSCertPath:    getEnv("TLS_CERT_PATH", "cert.pem"),
+		TLSKeyPath:     getEnv("TLS_KEY_PATH", "key.pem"),
+	}
+
+	if err := validateConfig(cfg); err != nil {
+		panic(fmt.Sprintf("Configuration validation failed: %v", err))
+	}
+	return cfg
+}
+
+func getEnv(key, defaultVal string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return defaultVal
+}
+
+func getEnvAsInt(key string, defaultVal int) int {
+	if value, exists := os.LookupEnv(key); exists {
+		if i, err := strconv.Atoi(value); err == nil {
+			return i
+		}
+	}
+	return defaultVal
+}
+
+func getEnvAsFloat(key string, defaultVal float64) float64 {
+	if value, exists := os.LookupEnv(key); exists {
+		if f, err := strconv.ParseFloat(value, 64); err == nil {
+			return f
+		}
+	}
+	return defaultVal
+}
+
+func getEnvAsDuration(key string, defaultVal time.Duration) time.Duration {
+	if value, exists := os.LookupEnv(key); exists {
+		if d, err := time.ParseDuration(value); err == nil {
+			return d
+		}
+	}
+	return defaultVal
+}
+
+// LNDClientPool manages a pool of gRPC connections to LND
+type LNDClientPool struct {
+	pool    chan *grpc.ClientConn
+	cfg     Config
+	logger  *logrus.Logger
+	metrics *prometheus.GaugeVec
+}
+
+func NewLNDClientPool(cfg Config, size int, logger *logrus.Logger) (*LNDClientPool, error) {
+	pool := make(chan *grpc.ClientConn, size)
+	metrics := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "lnd_pool_connections",
+			Help: "Number of active LND connections in the pool",
+		},
+		[]string{"state"},
+	)
+	if err := prometheus.Register(metrics); err != nil {
+		return nil, fmt.Errorf("failed to register LND pool metrics: %w", err)
+	}
+
+	for i := 0; i < size; i++ {
+		conn, err := createLNDConnection(cfg)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				if conn := <-pool; conn != nil {
+					conn.Close()
+				}
+			}
+			prometheus.Unregister(metrics)
+			return nil, err
+		}
+		pool <- conn
+	}
+
+	metrics.WithLabelValues("active").Set(float64(size))
+	return &LNDClientPool{
+		pool:    pool,
+		cfg:     cfg,
+		logger:  logger,
+		metrics: metrics,
+	}, nil
+}
+
+func createLNDConnection(cfg Config) (*grpc.ClientConn, error) {
+	cert, err := os.ReadFile(cfg.LNDCertPath)
+	if err != nil {
+		return nil, NewWrappedError(ErrLNDConnection, "LND", fmt.Sprintf("failed to read certificate: %v", err))
+	}
+	creds, err := credentials.NewClientTLSFromCert(tls.X509Certs(cert), "")
+	if err != nil {
+		return nil, NewWrappedError(ErrLNDConnection, "LND", fmt.Sprintf("failed to create TLS credentials: %v", err))
+	}
+	mac, err := os.ReadFile(cfg.LNCMacPath)
+	if err != nil {
+		return nil, NewWrappedError(ErrLNDConnection, "LND", fmt.Sprintf("failed to read macaroon: %v", err))
+	}
+	macCred := grpc.PerRPCCredentials(&macaroonCred{macaroon: mac})
+	return grpc.Dial(cfg.LNDHost,
+		grpc.WithTransportCredentials(creds),
+		grpc.WithPerRPCCredentials(macCred),
+		grpc.WithBlock(),
+		grpc.WithTimeout(5*time.Second),
+	)
+}
+
+type macaroonCred struct {
+	macaroon []byte
+}
+
+func (m *macaroonCred) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	return map[string]string{
+		"macaroon": hex.EncodeToString(m.macaroon),
+	}, nil
+}
+
+func (m *macaroonCred) RequireTransportSecurity() bool {
+	return true
+}
+
+func (p *LNDClientPool) Get() (*grpc.ClientConn, error) {
+	select {
+	case conn := <-p.pool:
+		if conn.GetState() == connectivity.Ready {
+			p.metrics.WithLabelValues("active").Inc()
+			return conn, nil
+		}
+		conn.Close()
+		newConn, err := createLNDConnection(p.cfg)
+		if err != nil {
+			p.metrics.WithLabelValues("failed").Inc()
+			return nil, err
+		}
+		p.metrics.WithLabelValues("active").Inc()
+		return newConn, nil
+	default:
+		newConn, err := createLNDConnection(p.cfg)
+		if err != nil {
+			p.metrics.WithLabelValues("failed").Inc()
+			return nil, err
+		}
+		p.metrics.WithLabelValues("active").Inc()
+		return newConn, nil
+	}
+}
+
+func (p *LNDClientPool) Put(conn *grpc.ClientConn) {
+	if conn.GetState() != connectivity.Ready {
+		conn.Close()
+		p.metrics.WithLabelValues("active").Dec()
+		return
+	}
+	select {
+	case p.pool <- conn:
+		p.metrics.WithLabelValues("active").Inc()
+	default:
+		conn.Close()
+		p.metrics.WithLabelValues("active").Dec()
+		p.logger.Info("LND connection pool full, closing extra connection")
+	}
+}
+
+func (p *LNDClientPool) Close() {
+	for len(p.pool) > 0 {
+		if conn := <-p.pool; conn != nil {
+			conn.Close()
+			p.metrics.WithLabelValues("active").Dec()
+		}
+	}
+	prometheus.Unregister(p.metrics)
+}
+
+func (p *LNDClientPool) Reset() error {
+	p.Close()
+	for i := 0; i < cap(p.pool); i++ {
+		conn, err := createLNDConnection(p.cfg)
+		if err != nil {
+			return err
+		}
+		p.pool <- conn
+	}
+	p.metrics.WithLabelValues("active").Set(float64(cap(p.pool)))
+	p.logger.Info("LND connection pool reset successfully")
+	return nil
+}
+
+// Node represents a Lightning Network node
+type Node struct {
+	Fields map[string]interface{} `json:"fields"`
+}
+
+// NodeRankings holds the fetched data (v1 structure)
+type NodeRankings struct {
+	Nodes          []Node                 `json:"nodes"`
+	LastUpdated    time.Time              `json:"lastUpdated"`
+	BitcoinData    map[string]interface{} `json:"bitcoinData"`
+	LocalNodeStats map[string]interface{} `json:"localNodeStats"`
+}
+
+// Agent manages data fetching and storage
+type Agent struct {
+	config             Config
+	logger             *logrus.Logger
+	rankings           NodeRankings
+	mutex              sync.Mutex
+	client             *http.Client
+	limiter            *rate.Limiter
+	stopChan           chan struct{}
+	openbbCache        map[string]interface{}
+	cacheTTL           time.Duration
+	cacheLastFetch     time.Time
+	fetchCounter       *prometheus.CounterVec
+	fetchDuration      *prometheus.HistogramVec
+	nodesFetched       prometheus.Gauge
+	apiKeyDaysToExpiry prometheus.Gauge
+	configChan         chan Config
+	lndPool            *LNDClientPool
+}
+
+func NewAgent(cfg Config, logger *logrus.Logger) (*Agent, error) {
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
+
+	fetchCounter := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agent_fetch_requests_total",
+			Help: "Total number of fetch requests made",
+		},
+		[]string{"source", "status"},
+	)
+	fetchDuration := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "agent_fetch_duration_seconds",
+			Help:    "Duration of fetch requests in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"source"},
+	)
+	nodesFetched := prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agent_nodes_fetched",
+			Help: "Number of nodes currently fetched",
+		},
+	)
+	apiKeyDaysToExpiry := prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agent_api_key_days_to_expiry",
+			Help: "Days until Amboss API key expires",
+		},
+	)
+
+	metrics := []prometheus.Collector{fetchCounter, fetchDuration, nodesFetched, apiKeyDaysToExpiry}
+	for i, metric := range metrics {
+		if err := prometheus.Register(metric); err != nil {
+			// Cleanup previously registered metrics on failure
+			for j := 0; j < i; j++ {
+				prometheus.Unregister(metrics[j])
+			}
+			return nil, fmt.Errorf("failed to register Prometheus metric %T: %w", metric, err)
+		}
+	}
+
+	var lndPool *LNDClientPool
+	if cfg.LNDHost != "" && cfg.LNDCertPath != "" && cfg.LNCMacPath != "" {
+		pool, err := NewLNDClientPool(cfg, lndPoolSize, logger)
+		if err != nil {
+			// Cleanup registered metrics on LND pool failure
+			for _, metric := range metrics {
+				prometheus.Unregister(metric)
+			}
+			return nil, NewWrappedError(err, "Agent", "Failed to initialize LND connection pool")
+		}
+		lndPool = pool
+	}
+
+	return &Agent{
+		config:             cfg,
+		logger:             logger,
+		client:             &http.Client{Timeout: 10 * time.Second},
+		limiter:            rate.NewLimiter(rate.Limit(cfg.RequestsPerSec), cfg.BurstLimit),
+		stopChan:           make(chan struct{}),
+		rankings:           NodeRankings{BitcoinData: make(map[string]interface{}), LocalNodeStats: make(map[string]interface{})},
+		openbbCache:        make(map[string]interface{}),
+		cacheTTL:           openbbUpdateInterval,
+		cacheLastFetch:     time.Time{},
+		fetchCounter:       fetchCounter,
+		fetchDuration:      fetchDuration,
+		nodesFetched:       nodesFetched,
+		apiKeyDaysToExpiry: apiKeyDaysToExpiry,
+		configChan:         make(chan Config),
+		lndPool:            lndPool,
+	}, nil
+}
+
+func min(d1, d2 time.Duration) time.Duration {
+	if d1 < d2 {
+		return d1
+	}
+	return d2
+}
+
+func (a *Agent) FetchWithBackoff(ctx context.Context, fetchFunc func(context.Context) error, name string) error {
+    attempts := 0
+    maxAttempts := a.config.MaxRetries + 1
+    baseDelay := a.config.RetryDelay
+
+    for attempts < maxAttempts {
+        if err := ctx.Err(); err != nil {
+            return err
+        }
+
+        start := time.Now()
+        err := fetchFunc(ctx)
+        attempts++
+
+        if err == nil {
+            a.fetchCounter.WithLabelValues(name, "success").Inc()
+            a.fetchDuration.WithLabelValues(name).Observe(time.Since(start).Seconds())
+            return nil
+        }
+
+        status := "error"
+        a.fetchCounter.WithLabelValues(name, status).Inc()
+        a.fetchDuration.WithLabelValues(name).Observe(time.Since(start).Seconds())
+
+        if !isRetryable(err) || attempts == maxAttempts {
+            a.logger.WithFields(logrus.Fields{
+                "error":    err.Error(),
+                "source":   name,
+                "attempts": attempts,
+            }).Error("Fetch failed")
+            a.triggerRecovery(name, err)
+            return err
+        }
+
+        delay := min(baseDelay*time.Duration(1<<attempts), maxDelay)
+        jitter := time.Duration(rand.Int63n(int64(time.Second)))
+        totalDelay := delay + jitter
+
+        a.logger.WithFields(logrus.Fields{
+            "error":    err.Error(),
+            "source":   name,
+            "attempt":  attempts,
+            "retry_in": totalDelay.String(),
+        }).Warn("Retrying after error")
+        select {
+        case <-time.After(totalDelay):
+        case <-ctx.Done():
+            return ctx.Err()
+        }
+    }
+    return nil
+}
+
+func (a *Agent) triggerRecovery(source string, err error) {
+	a.logger.WithFields(logrus.Fields{
+		"source": source,
+		"error":  err.Error(),
+	}).Warn("Triggering recovery actions")
+
+	switch source {
+	case "Amboss":
+		a.mutex.Lock()
+		a.client = &http.Client{Timeout: 10 * time.Second}
+		a.limiter = rate.NewLimiter(rate.Limit(a.config.RequestsPerSec), a.config.BurstLimit)
+		a.mutex.Unlock()
+		a.logger.Info("Reset Amboss HTTP client and rate limiter")
+	case "OpenBB":
+		a.mutex.Lock()
+		a.openbbCache = make(map[string]interface{})
+		a.cacheLastFetch = time.Time{}
+		a.mutex.Unlock()
+		a.logger.Info("Cleared OpenBB cache")
+	case "LND":
+		if a.lndPool != nil {
+			if resetErr := a.lndPool.Reset(); resetErr != nil {
+				a.logger.WithFields(logrus.Fields{
+					"error": resetErr.Error(),
+				}).Error("Failed to reset LND connection pool")
+			} else {
+				a.logger.Info("Reset LND connection pool")
+			}
+		}
+	}
+}
+
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var wrappedErr *WrappedError
+	if errors.As(err, &wrappedErr) {
+		switch wrappedErr.Err {
+		case ErrNetworkFailure, ErrRateLimitExceeded, ErrLNDConnection:
+			return true
+		case ErrScriptExecution, ErrCommandFailure:
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+var rankingsQuery = `
+query Rankings($first: Int, $after: String) {
+    getNodeRankings(first: $first, after: $after) {
+        edges {
+            node {
+                pubkey
+                alias
+                capacity
+                channelCount
+                rank
+                rankChange {
+                    day
+                    week
+                    month
+                }
+                uptimePercentage
+                channels {
+                    feeRate
+                }
+            }
+            cursor
+        }
+        pageInfo {
+            hasNextPage
+            endCursor
+        }
+    }
+}
+`
+
+func (a *Agent) FetchRankings(ctx context.Context) error {
+    var allNodes []Node
+    after := ""
+    hasNextPage := true
+
+    for hasNextPage {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        default:
+            if err := a.limiter.Wait(ctx); err != nil {
+                return NewWrappedError(ErrRateLimitExceeded, "Amboss", fmt.Sprintf("rate limiter error: %v", err))
+            }
+
+            reqBody := map[string]interface{}{
+                "query": rankingsQuery,
+                "variables": map[string]interface{}{
+                    "first": defaultPageSize,
+                    "after": after,
+                },
+            }
+
+            body, err := json.Marshal(reqBody)
+            if err != nil {
+                return NewWrappedError(ErrDataParseFailure, "Amboss", fmt.Sprintf("failed to marshal request body: %v", err))
+            }
+
+            req, err := http.NewRequestWithContext(ctx, "POST", ambossAPIEndpoint, bytes.NewBuffer(body))
+            if err != nil {
+                return NewWrappedError(ErrNetworkFailure, "Amboss", fmt.Sprintf("failed to create request: %v", err))
+            }
+
+            req.Header.Set("Content-Type", "application/json")
+            req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.config.AmbossAPIKey))
+
+            resp, err := a.client.Do(req)
+            if err != nil {
+                return NewWrappedError(ErrNetworkFailure, "Amboss", fmt.Sprintf("failed to fetch rankings: %v", err))
+            }
+            defer resp.Body.Close()
+
+            if resp.StatusCode != http.StatusOK {
+                bodyBytes, _ := io.ReadAll(resp.Body)
+                return NewWrappedError(ErrNetworkFailure, "Amboss", fmt.Sprintf("unexpected status code: %d, body: %s", resp.StatusCode, string(bodyBytes)))
+            }
+
+            var result struct {
+                Data struct {
+                    GetNodeRankings struct {
+                        Edges []struct {
+                            Node   map[string]interface{} `json:"node"`
+                            Cursor string                 `json:"cursor"`
+                        } `json:"edges"`
+                        PageInfo struct {
+                            HasNextPage bool   `json:"hasNextPage"`
+                            EndCursor   string `json:"endCursor"`
+                        } `json:"pageInfo"`
+                    } `json:"getNodeRankings"`
+                } `json:"data"`
+                Errors []struct {
+                    Message string `json:"message"`
+                } `json:"errors"`
+            }
+            if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+                return NewWrappedError(ErrDataParseFailure, "Amboss", fmt.Sprintf("failed to decode response: %v", err))
+            }
+
+            if len(result.Errors) > 0 {
+                return NewWrappedError(ErrNetworkFailure, "Amboss", fmt.Sprintf("API returned errors: %v", result.Errors))
+            }
+
+            for _, edge := range result.Data.GetNodeRankings.Edges {
+                nodeFields := edge.Node
+                if _, exists := nodeFields["avgRoutingFee"]; !exists {
+                    if channels, ok := nodeFields["channels"].([]interface{}); ok && len(channels) > 0 {
+                        var totalFee float64
+                        count := 0
+                        for _, ch := range channels {
+                            if chMap, ok := ch.(map[string]interface{}); ok {
+                                if fee, ok := chMap["feeRate"].(float64); ok {
+                                    totalFee += fee
+                                    count++
+                                }
+                            }
+                        }
+                        if count > 0 {
+                            nodeFields["avgRoutingFee"] = totalFee / float64(count)
+                        } else {
+                            nodeFields["avgRoutingFee"] = 0.0
+                        }
+                    }
+                }
+
+                if _, exists := nodeFields["uptimePercentage"]; !exists {
+                    nodeFields["uptimePercentage"] = 0.0
+                    a.logger.WithFields(logrus.Fields{
+                        "pubkey": nodeFields["pubkey"],
+                    }).Warn("uptimePercentage not provided")
+                }
+                if _, exists := nodeFields["successRate"]; !exists {
+                    nodeFields["successRate"] = 0.0
+                    a.logger.WithFields(logrus.Fields{
+                        "pubkey": nodeFields["pubkey"],
+                    }).Warn("successRate not provided")
+                }
+
+                allNodes = append(allNodes, Node{Fields: nodeFields})
+            }
+
+            hasNextPage = result.Data.GetNodeRankings.PageInfo.HasNextPage
+            after = result.Data.GetNodeRankings.PageInfo.EndCursor
+        }
+    }
+
+    a.mutex.Lock()
+    a.rankings.Nodes = allNodes
+    a.rankings.LastUpdated = time.Now()
+    a.nodesFetched.Set(float64(len(allNodes)))
+    a.mutex.Unlock()
+    a.logger.WithFields(logrus.Fields{
+        "nodes_fetched": len(allNodes),
+        "source":        "Amboss",
+    }).Info("Successfully fetched node rankings")
+    return nil
+}
+
+func (a *Agent) FetchOpenBBData(ctx context.Context) error {
+    a.mutex.Lock()
+    defer a.mutex.Unlock()
+
+    if time.Since(a.cacheLastFetch) < a.cacheTTL && len(a.openbbCache) > 0 {
+        a.logger.WithFields(logrus.Fields{
+            "source": "OpenBB",
+        }).Info("Using cached OpenBB data")
+        a.rankings.BitcoinData = a.openbbCache
+        return nil
+    }
+
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    default:
+        cmd := exec.CommandContext(ctx, "python3", "-c", fmt.Sprintf(openbbScriptTemplate, a.config.OpenBBPAT))
+        var out bytes.Buffer
+        var stderr bytes.Buffer
+        cmd.Stdout = &out
+        cmd.Stderr = &stderr
+
+        if err := cmd.Run(); err != nil {
+            return NewWrappedError(ErrScriptExecution, "OpenBB", fmt.Sprintf("failed to execute script: %v, stderr: %s", err, stderr.String()))
+        }
+
+        var btcData map[string]interface{}
+        if err := json.Unmarshal(out.Bytes(), &btcData); err != nil {
+            return NewWrappedError(ErrDataParseFailure, "OpenBB", fmt.Sprintf("failed to parse data: %v, output: %s", err, out.String()))
+        }
+
+        if len(btcData) == 0 {
+            return NewWrappedError(ErrDataParseFailure, "OpenBB", "script returned empty data")
+        }
+
+        a.openbbCache = btcData
+        a.cacheLastFetch = time.Now()
+        a.rankings.BitcoinData = btcData
+        a.logger.WithFields(logrus.Fields{
+            "price":      btcData["bitcoin_price"],
+            "market_cap": btcData["bitcoin_market_cap"],
+            "source":     "OpenBB",
+        }).Info("Successfully fetched and cached OpenBB Bitcoin data")
+        return nil
+    }
+}
+
+func (a *Agent) FetchLocalNodeStats(ctx context.Context) error {
+    if a.lndPool == nil {
+        a.logger.WithFields(logrus.Fields{
+            "source": "LND",
+        }).Warn("LND configuration incomplete, skipping local node stats")
+        return nil
+    }
+
+    runLncli := func(ctx context.Context, command string, args ...string) (map[string]interface{}, error) {
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        default:
+            conn, err := a.lndPool.Get()
+            if err != nil {
+                return nil, NewWrappedError(ErrLNDConnection, "LND", fmt.Sprintf("failed to get connection: %v", err))
+            }
+            defer a.lndPool.Put(conn)
+
+            baseArgs := []string{
+                "--rpcserver", a.config.LNDHost,
+                "--tlscertpath", a.config.LNDCertPath,
+                "--macaroonpath", a.config.LNCMacPath,
+            }
+            cmdArgs := append(baseArgs, command)
+            cmdArgs = append(cmdArgs, args...)
+            cmd := exec.CommandContext(ctx, "lncli", cmdArgs...)
+            var out bytes.Buffer
+            var stderr bytes.Buffer
+            cmd.Stdout = &out
+            cmd.Stderr = &stderr
+            if err := cmd.Run(); err != nil {
+                return nil, NewWrappedError(ErrCommandFailure, "LND", fmt.Sprintf("failed to run %s: %v, stderr: %s", command, err, stderr.String()))
+            }
+            var result map[string]interface{}
+            if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+                return nil, NewWrappedError(ErrDataParseFailure, "LND", fmt.Sprintf("failed to parse %s output: %v, output: %s", command, err, out.String()))
+            }
+            return result, nil
+        }
+    }
+
+    stats := make(map[string]interface{})
+    var wg sync.WaitGroup
+    errChan := make(chan error, 6)
+
+    commands := map[string]func(context.Context) (map[string]interface{}, error){
+        "info": func(ctx context.Context) (map[string]interface{}, error) {
+            return runLncli(ctx, "getinfo")
+        },
+        "channels": func(ctx context.Context) (map[string]interface{}, error) {
+            return runLncli(ctx, "listchannels")
+        },
+        "wallet_balance": func(ctx context.Context) (map[string]interface{}, error) {
+            return runLncli(ctx, "walletbalance")
+        },
+        "channel_balance": func(ctx context.Context) (map[string]interface{}, error) {
+            return runLncli(ctx, "channelbalance")
+        },
+        "peers": func(ctx context.Context) (map[string]interface{}, error) {
+            return runLncli(ctx, "peers")
+        },
+        "fwdinghistory": func(ctx context.Context) (map[string]interface{}, error) {
+            return runLncli(ctx, "fwdinghistory", "--start_time", fmt.Sprintf("%d", time.Now().Add(-24*time.Hour).Unix()), "--end_time", fmt.Sprintf("%d", time.Now().Unix()))
+        },
+    }
+
+    for key, fn := range commands {
+        wg.Add(1)
+        go func(ctx context.Context, key string, fetch func(context.Context) (map[string]interface{}, error)) {
+            defer wg.Done()
+            if result, err := fetch(ctx); err != nil {
+                errChan <- err
+            } else {
+                a.mutex.Lock()
+                if key == "channels" || key == "peers" || key == "fwdinghistory" {
+                    stats[key] = result[key]
+                } else {
+                    stats[key] = result
+                }
+                a.mutex.Unlock()
+            }
+        }(ctx, key, fn)
+    }
+
+    wg.Wait()
+    close(errChan)
+
+    var errors []error
+    for err := range errChan {
+        errors = append(errors, err)
+        a.logger.WithFields(logrus.Fields{
+            "error":  err.Error(),
+            "source": "LND",
+        }).Error("LND fetch error")
+    }
+
+    if len(stats) > 0 {
+        a.mutex.Lock()
+        a.rankings.LocalNodeStats = stats
+        a.mutex.Unlock()
+        channels, _ := stats["channels"].([]interface{})
+        peers, _ := stats["peers"].([]interface{})
+        fwdEvents, _ := stats["fwdinghistory"].(map[string]interface{})
+        a.logger.WithFields(logrus.Fields{
+            "pubkey":           stats["info"].(map[string]interface{})["identity_pubkey"],
+            "channels":         len(channels),
+            "peers":            len(peers),
+            "forwarded_events": len(fwdEvents["forwarding_events"].([]interface{})),
+            "source":           "LND",
+        }).Info("Fetched local node stats")
+    }
+
+    if len(errors) > 0 {
+        return NewWrappedError(fmt.Errorf("multiple errors: %v", errors), "LND", fmt.Sprintf("partial failure fetching stats: %d errors occurred", len(errors)))
+    }
+    return nil
+}
+
+func (a *Agent) ReloadConfig(newConfig Config) error {
+    if err := validateConfig(newConfig); err != nil {
+        return err
+    }
+
+    a.mutex.Lock()
+    defer a.mutex.Unlock()
+
+    oldConfig := a.config
+    a.config = newConfig
+    a.limiter = rate.NewLimiter(rate.Limit(newConfig.RequestsPerSec), newConfig.BurstLimit)
+    a.client.Timeout = 10 * time.Second
+
+    if a.lndPool != nil && (newConfig.LNDHost != oldConfig.LNDHost ||
+        newConfig.LNDCertPath != oldConfig.LNDCertPath ||
+        newConfig.LNCMacPath != oldConfig.LNCMacPath) {
+        a.lndPool.Close()
+        newPool, err := NewLNDClientPool(newConfig, lndPoolSize, a.logger)
+        if err != nil {
+            return NewWrappedError(err, "Reload", "Failed to reinitialize LND pool")
+        }
+        a.lndPool = newPool
+    }
+
+    a.logger.WithFields(logrus.Fields{
+        "old_port":             oldConfig.Port,
+        "new_port":             newConfig.Port,
+        "old_requests_per_sec": oldConfig.RequestsPerSec,
+        "new_requests_per_sec": newConfig.RequestsPerSec,
+    }).Info("Configuration reloaded successfully")
+    return nil
+}
+
+func (a *Agent) CheckAPIKeyExpiration() (time.Time, error) {
+	token, err := jwt.Parse(a.config.AmbossAPIKey, func(token *jwt.Token) (interface{}, error) {
+		return nil, nil
+	}, jwt.WithValidMethods([]string{}))
+	if err != nil {
+		return time.Time{}, NewWrappedError(ErrAPIKeyInvalid, "Amboss", fmt.Sprintf("failed to parse API key: %v", err))
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return time.Time{}, NewWrappedError(ErrAPIKeyInvalid, "Amboss", "invalid claims format")
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return time.Time{}, NewWrappedError(ErrAPIKeyInvalid, "Amboss", "expiration not found or invalid")
+	}
+	expTime := time.Unix(int64(exp), 0)
+	a.apiKeyDaysToExpiry.Set(float64(time.Until(expTime).Hours() / 24))
+	return expTime, nil
+}
+
+func (a *Agent) MonitorAPIKey(ctx context.Context, notifyInterval time.Duration) {
+	ticker := time.NewTicker(notifyInterval)
+	defer ticker.Stop()
+
+	renewalInstructions := `Your API key expires soon! Renew it manually:
+1. Visit https://amboss.space and log in.
+2. Go to Account Panel > API Keys.
+3. Click "Create New Key".
+4. Update 'AmbossAPIKey' in your Config and restart the app.
+For help, contact Amboss via Telegram/Twitter.
+KIMANDI LND
+FEEL FREE TO DONATE @ bc1q6tep0u9gp408spl0s6qdlswpu793mn7fmkdy6m`
+
+	hasNotified := false
+	today := time.Date(2025, time.March, 23, 0, 0, 0, 0, time.UTC)
+
+	for {
+		select {
+		case <-ctx.Done():
+			a.logger.Info("Stopping API key monitoring due to context cancellation")
+			return
+		case <-ticker.C:
+			expTime, err := a.CheckAPIKeyExpiration()
+			if err != nil {
+				a.logger.WithFields(logrus.Fields{
+					"error": err.Error(),
+				}).Error("Failed to check API key expiration")
+				continue
+			}
+			daysUntilExpiry := int(time.Until(expTime).Hours() / 24)
+			renewalThreshold := 30
+
+			if expTime.Year() == today.Year() && expTime.Month() == today.Month() && expTime.Day() == today.Day() {
+				a.logger.WithFields(logrus.Fields{
+					"expires_at": expTime.Format(time.RFC3339),
+				}).Info("API key expires today, skipping notification")
+				continue
+			}
+
+			if daysUntilExpiry <= renewalThreshold && !hasNotified {
+				a.logger.WithFields(logrus.Fields{
+					"days_until_expiry": daysUntilExpiry,
+					"expires_at":        expTime.Format(time.RFC3339),
+					"instructions":      renewalInstructions,
+				}).Warn("API key expires soon")
+				hasNotified = true
+			} else if daysUntilExpiry > renewalThreshold {
+				a.logger.WithFields(logrus.Fields{
+					"days_until_expiry": daysUntilExpiry,
+					"expires_at":        expTime.Format(time.RFC3339),
+				}).Info("API key still valid")
+				hasNotified = false
+			}
+		}
+	}
+}
+
+func (a *Agent) StartMonitoring() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	a.stopChan = make(chan struct{})
+	go func() {
+		<-a.stopChan
+		cancel()
+	}()
+
+	go a.MonitorAPIKey(ctx, 24*time.Hour)
+
+	var wg sync.WaitGroup
+	fetchFuncs := []struct {
+		fn   func(context.Context) error
+		name string
+	}{
+		{a.FetchRankings, "Amboss"},
+		{a.FetchOpenBBData, "OpenBB"},
+		{a.FetchLocalNodeStats, "LND"},
+	}
+
+	for _, f := range fetchFuncs {
+		wg.Add(1)
+		go func(fn func(context.Context) error, name string) {
+			defer wg.Done()
+			if err := a.FetchWithBackoff(ctx, fn, name); err != nil {
+				a.logger.WithFields(logrus.Fields{
+					"error":  err.Error(),
+					"source": name,
+				}).Error("Initial fetch failed after retries")
+			}
+		}(f.fn, f.name)
+	}
+	wg.Wait()
+	a.logger.Info("Initial parallel fetches completed")
+
+	ambossTicker := time.NewTicker(updateInterval)
+	openbbTicker := time.NewTicker(openbbUpdateInterval)
+	localTicker := time.NewTicker(localUpdateInterval)
+	defer ambossTicker.Stop()
+	defer openbbTicker.Stop()
+	defer localTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			a.logger.Info("Monitoring stopped due to context cancellation")
+			return
+		case newConfig := <-a.configChan:
+			if err := a.ReloadConfig(newConfig); err != nil {
+				a.logger.WithFields(logrus.Fields{
+					"error": err.Error(),
+				}).Error("Failed to reload configuration")
+			}
+		case <-ambossTicker.C:
+			go func() {
+				if err := a.FetchWithBackoff(ctx, a.FetchRankings, "Amboss"); err != nil {
+					a.logger.WithFields(logrus.Fields{
+						"error":  err.Error(),
+						"source": "Amboss",
+					}).Error("Periodic fetch failed after retries")
+				}
+			}()
+		case <-openbbTicker.C:
+			go func() {
+				if err := a.FetchWithBackoff(ctx, a.FetchOpenBBData, "OpenBB"); err != nil {
+					a.logger.WithFields(logrus.Fields{
+						"error":  err.Error(),
+						"source": "OpenBB",
+					}).Error("Periodic fetch failed after retries")
+				}
+			}()
+		case <-localTicker.C:
+			go func() {
+				if err := a.FetchWithBackoff(ctx, a.FetchLocalNodeStats, "LND"); err != nil {
+					a.logger.WithFields(logrus.Fields{
+						"error":  err.Error(),
+						"source": "LND",
+					}).Error("Periodic fetch failed after retries")
+				}
+			}()
+		}
+	}
+}
+
+func (a *Agent) StopMonitoring() {
+	if a.stopChan != nil {
+		close(a.stopChan)
+	}
+	if a.lndPool != nil {
+		a.lndPool.Close()
+	}
+}
+
+func (a *Agent) GetRankings() NodeRankings {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	return a.rankings
+}
+
+func (a *Agent) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := r.Header.Get("Authorization")
+		expectedToken := getEnv("API_TOKEN", "secret-token")
+		if token != "Bearer "+expectedToken {
+			a.logger.WithFields(logrus.Fields{
+				"method": r.Method,
+				"path":   r.URL.Path,
+			}).Warn("Unauthorized access attempt")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// V1 Handlers
+func (a *Agent) v1RankingsHandler(w http.ResponseWriter, r *http.Request) {
+	rankings := a.GetRankings()
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("API-Version", "v1")
+	if err := json.NewEncoder(w).Encode(rankings); err != nil {
+		a.logger.WithFields(logrus.Fields{
+			"error":  err.Error(),
+			"version": "v1",
+		}).Error("Failed to encode rankings")
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	}
+}
+
+func (a *Agent) v1KeyStatusHandler(w http.ResponseWriter, r *http.Request) {
+	expTime, err := a.CheckAPIKeyExpiration()
+	if err != nil {
+		a.logger.WithFields(logrus.Fields{
+			"error":  err.Error(),
+			"version": "v1",
+		}).Error("Failed to check API key expiration")
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	daysUntilExpiry := int(time.Until(expTime).Hours() / 24)
+	response := struct {
+		DaysUntilExpiry int    `json:"days_until_expiry"`
+		ExpiresAt       string `json:"expires_at"`
+		Instructions    string `json:"instructions"`
+	}{
+		DaysUntilExpiry: daysUntilExpiry,
+		ExpiresAt:       expTime.Format(time.RFC3339),
+		Instructions: `Your API key expires soon! Renew it manually:
+1. Visit https://amboss.space and log in.
+2. Go to Account Panel > API Keys.
+3. Click "Create New Key".
+4. Update 'AmbossAPIKey' in your Config and restart the app.
+For help, contact Amboss via Telegram/Twitter.
+KIMANDI LND
+FEEL FREE TO DONATE @ bc1q6tep0u9gp408spl0s6qdlswpu793mn7fmkdy6m`,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("API-Version", "v1")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		a.logger.WithFields(logrus.Fields{
+			"error":  err.Error(),
+			"version": "v1",
+		}).Error("Failed to encode key status")
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	}
+}
+
+var startTime = time.Now()
+
+func (a *Agent) v1HealthHandler(w http.ResponseWriter, r *http.Request) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	status := struct {
+		LastUpdated      time.Time `json:"last_updated"`
+		NodeCount        int       `json:"node_count"`
+		BitcoinDataAge   string    `json:"bitcoin_data_age"`
+		LocalStatsAge    string    `json:"local_stats_age"`
+		ChannelCount     int       `json:"channel_count"`
+		PeerCount        int       `json:"peer_count"`
+		Uptime           string    `json:"uptime"`
+	}{
+		LastUpdated:    a.rankings.LastUpdated,
+		NodeCount:      len(a.rankings.Nodes),
+		BitcoinDataAge: time.Since(a.cacheLastFetch).String(),
+		LocalStatsAge:  time.Since(a.rankings.LastUpdated).String(),
+		ChannelCount:   0,
+		PeerCount:      0,
+		Uptime:         time.Since(startTime).String(),
+	}
+
+	if channels, ok := a.rankings.LocalNodeStats["channels"].([]interface{}); ok {
+		status.ChannelCount = len(channels)
+	}
+	if peers, ok := a.rankings.LocalNodeStats["peers"].([]interface{}); ok {
+		status.PeerCount = len(peers)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("API-Version", "v1")
+	if err := json.NewEncoder(w).Encode(status); err != nil {
+		a.logger.WithFields(logrus.Fields{
+			"error":  err.Error(),
+			"version": "v1",
+		}).Error("Failed to encode health status")
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	}
+}
+
+func main() {
+	logger := logrus.New()
+	logger.SetFormatter(&logrus.TextFormatter{})
+	logger.SetLevel(logrus.InfoLevel)
+
+	file, err := os.OpenFile("agent.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		logger.Warn("Failed to open log file, using stdout")
+	} else {
+		logger.SetOutput(file)
+	}
+
+	config := loadConfig()
+	agent, err := NewAgent(config, logger)
+	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"error": err.Error(),
+		}).Fatal("Failed to initialize agent")
+	}
+
+	agent.StartMonitoring()
+	defer agent.StopMonitoring()
+
+	fs := http.FileServer(http.FS(staticFiles))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			content, err := staticFiles.ReadFile("static/index.html")
+			if err != nil {
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			w.Write(content)
+			return
+		}
+		if r.URL.Path == "/styles.css" {
+			content, err := staticFiles.ReadFile("static/styles.css")
+			if err != nil {
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/css")
+			w.Write(content)
+			return
+		}
+		fs.ServeHTTP(w, r)
+	})
+
+	// Versioned API routes
+	http.HandleFunc(fmt.Sprintf("/%s/api/rankings", currentAPIVersion), agent.authMiddleware(agent.v1RankingsHandler))
+	http.HandleFunc(fmt.Sprintf("/%s/api/key-status", currentAPIVersion), agent.authMiddleware(agent.v1KeyStatusHandler))
+	http.HandleFunc(fmt.Sprintf("/%s/api/health", currentAPIVersion), agent.v1HealthHandler)
+
+	// Unversioned metrics endpoint (not typically versioned)
+	http.Handle("/metrics", promhttp.Handler())
+
+	// Legacy redirect for unversioned API endpoints (optional)
+	http.HandleFunc("/api/rankings", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, fmt.Sprintf("/%s/api/rankings", currentAPIVersion), http.StatusMovedPermanently)
+	})
+	http.HandleFunc("/api/key-status", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, fmt.Sprintf("/%s/api/key-status", currentAPIVersion), http.StatusMovedPermanently)
+	})
+	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, fmt.Sprintf("/%s/api/health", currentAPIVersion), http.StatusMovedPermanently)
+	})
+
+	server := &http.Server{
+		Addr: ":" + config.Port,
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			},
+			PreferServerCipherSuites: true,
+		},
+		Handler: nil,
+	}
+
+	logger.WithFields(logrus.Fields{
+		"port":          config.Port,
+		"tls":           "enabled",
+		"api_version":   currentAPIVersion,
+		"versioned_endpoints": []string{
+			fmt.Sprintf("/%s/api/rankings", currentAPIVersion),
+			fmt.Sprintf("/%s/api/key-status", currentAPIVersion),
+			fmt.Sprintf("/%s/api/health", currentAPIVersion),
+		},
+	}).Info("Starting HTTPS server with API versioning")
+
+	go func() {
+		if err := server.ListenAndServeTLS(config.TLSCertPath, config.TLSKeyPath); err != nil && err != http.ErrServerClosed {
+			logger.WithFields(logrus.Fields{
+				"error": err.Error(),
+			}).Fatal("HTTPS server failed")
+		}
+	}()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+
+	for {
+		sig := <-sigChan
+		switch sig {
+		case syscall.SIGHUP:
+			newConfig := loadConfig()
+			agent.configChan <- newConfig
+			logger.Info("Received SIGHUP, reloading configuration")
+		case os.Interrupt, syscall.SIGTERM:
+			logger.Info("Shutting down server...")
+			agent.StopMonitoring()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := server.Shutdown(ctx); err != nil {
+				logger.WithFields(logrus.Fields{
+					"error": err.Error(),
+				}).Fatal("Server shutdown failed")
+			}
+			logger.Info("Server stopped")
+			return
+		}
+	}
+}
